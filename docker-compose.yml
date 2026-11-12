@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  learnly:
+    build:
+      context: .
+      # Override on the Pi: TARGETARCH=arm docker compose build
+      args:
+        TARGETARCH: ${TARGETARCH:-amd64}
+    image: learnly-scraper:latest
+    container_name: learnly
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Persist the SQLite database across container restarts
+      - ./data:/app/data
+
+    environment:
+      - DB_PATH=/app/data/harvest.db
+      - PYTHONUNBUFFERED=1
+      # Reddit OAuth credentials (optional — enables PRAW mode in reddit_public.py)
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID:-}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET:-}
+      - REDDIT_USERNAME=${REDDIT_USERNAME:-}
+      - REDDIT_PASSWORD=${REDDIT_PASSWORD:-}
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

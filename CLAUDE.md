@@ -1,16 +1,52 @@
-# Project Context
-This project is a data extraction pipeline designed to scrape Quebec CEGEP grades, class averages, and R-Scores from social media (Reddit, etc.) to reverse-engineer the Ministry of Education's IDGZ and ISGZ variables. The target output is a clean CSV dataset for a startup called Learnly.
+# Learnly R-Score Data Pipeline
+**Primary Goal:** Harvest self-reported academic data to reverse-engineer Quebec Ministry of Education R-Score parameters ($IDGZ$ and $ISGZ$).
 
-# Tech Stack & Infrastructure
-- Language: Python 3.11+
-- Key Libraries: PRAW (Reddit API), pandas, python-dotenv, re (regex)
-- Deployment: Docker container running as a cron job on a CasaOS (Raspberry Pi/ARM64) compute cluster.
+## System Architecture
+* **Scraping Engine:** Headless Playwright (authenticated via `storage_state.json`), Reddit crawler (handling nested comments), and future Appium mobile nodes.
+* **Extraction Engine:** `parsers/regex_extractor.py` handles bilingual text parsing, guarding against false positives (like course codes), and handles both forward ("cote r 35.2") and inverted ("35.2 cote r") linguistic structures.
+* **Ingestion API:** `api/receiver.py` (FastAPI) listens on port 8000 for JSON payloads `{"platform": "...", "raw_text": "..."}` from mobile devices and external scripts.
+* **Database:** SQLite in WAL mode (`data/harvest.db`) for concurrent reads/writes and idempotent migrations.
+* **Infrastructure:** Multi-stage Docker build optimized for CasaOS on Raspberry Pi 3 (`linux/arm/v7` / `arm64`).
 
-# Agent Behavioral Rules
-1. **Never Hallucinate Data:** Only write scripts that pull real data from live APIs. Never generate mock data unless explicitly asked to test a parsing function.
-2. **Defensive Scraping:** Social media APIs have rate limits. Always implement `time.sleep()`, error handling (`try/except` blocks), and logging for API requests. Do not write scripts that will immediately trigger an IP ban.
-3. **Bilingual Data Handling:** Quebec students use French and English interchangeably. Regex patterns must account for terms like "cote r", "r-score", "moyenne", "average", "CRC", and variations in spacing/punctuation.
-4. **Environment Variables:** Never hardcode API keys or passwords. Always use `os.getenv()` and assume credentials exist in a local `.env` file.
-5. **ARM64 Compatibility:** When writing the Dockerfile, ensure the base image and dependencies are compatible with linux/arm64 architecture for deployment on Raspberry Pi compute nodes.
-6. **Preserve Logic:** Do not overwrite working regex pipelines or API authentication functions just to add a new feature. Modularize code by creating helper functions instead of modifying the core extraction loop.
-7. **File Outputs:** Ensure all scraped data is appended to a structured CSV file with headers: `source`, `timestamp`, `program_or_course`, `grade`, `class_average`, `r_score`, `raw_text`.
+## Database Schema (`records` table)
+Whenever writing new ingestion scripts, aim to populate these fields via the regex extractor:
+* `id` (Primary Key, unique hash)
+* `platform` (TEXT)
+* `raw_text` (TEXT)
+* `r_score` (REAL)
+* `grade` (REAL)
+* `class_average` (REAL)
+* `cegep` (TEXT)
+* `std_dev` (REAL)
+* `credits` (REAL)
+* `high_school` (TEXT)
+
+## Core Commands (Cheat Sheet)
+**1. Run Local API Receiver (for mobile scraper testing):**
+```bash
+uvicorn api.receiver:app --host 0.0.0.0 --port 8000
+```
+
+**2. Run Headless Desktop Scraper (Reddit/Facebook/Discord):**
+```bash
+python3 -m extractors.playwright_scraper
+```
+*(Note: Requires `storage_state.json` generated via `python3 session_manager.py`)*
+
+**3. Check Database Coverage & Stats:**
+```bash
+curl http://localhost:8000/stats
+# OR via SQLite directly:
+sqlite3 -header -column data/harvest.db "SELECT platform, COUNT(*) AS total, SUM(CASE WHEN r_score IS NOT NULL THEN 1 ELSE 0 END) AS has_r_score, SUM(CASE WHEN high_school IS NOT NULL THEN 1 ELSE 0 END) AS has_hs FROM records GROUP BY platform;"
+```
+
+**4. Deploy to Docker / CasaOS:**
+```bash
+TARGETARCH=arm docker-compose up -d --build
+```
+
+## AI Agent Rules (Strict Directives)
+1. **Idempotency:** Always use `INSERT OR IGNORE` for DB writes. Schema updates must use safe `ALTER TABLE ... ADD COLUMN` statements wrapped in try/except blocks to prevent failure on existing tables.
+2. **Regex Updates:** When updating `parsers/regex_extractor.py`, ensure backward compatibility. Use `\b` guards to prevent false matches (e.g., catching 01 in "BIO 101"), and always account for bilingual (French/English) variations.
+3. **Resource Efficiency:** The final target hardware is a Raspberry Pi 3. Ensure memory usage stays low (e.g., block resources in Playwright, use SQLite read cursors for large iterations). 
+4. **Context Preservation:** Never overwrite `TARGET_PAGES` with dummy data if existing URLs (Reddit, Dawson, McGill) are already configured.

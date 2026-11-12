@@ -1,1 +1,4 @@
 .env
+storage_state.json
+tiktok_state.json
+tiktok_user_data/

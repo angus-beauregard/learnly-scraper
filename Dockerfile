@@ -1,28 +1,68 @@
-# Multi-stage build targeting linux/arm64 (Raspberry Pi / CasaOS)
-FROM python:3.11-slim-bookworm
+# =============================================================================
+# Multi-stage Dockerfile
+#
+# Primary target : linux/arm/v7  (Raspberry Pi 3, 32-bit Raspberry Pi OS)
+# Also builds on : linux/arm64   (Pi 3/4 with 64-bit OS)
+#                  linux/amd64   (dev / CI)
+#
+# Architecture notes
+# ------------------
+# Playwright Chromium ships binaries for amd64 and arm64 only.
+# On arm/v7 (32-bit) the browser-based scrapers are unavailable; the FastAPI
+# receiver and the requests-based reddit_public.py work on all architectures.
+#
+# Build for a specific platform:
+#   docker buildx build --platform linux/arm/v7  -t learnly:armv7  .
+#   docker buildx build --platform linux/arm64   -t learnly:arm64  .
+# =============================================================================
 
-# Explicit platform label so docker buildx picks the right variant
-ARG TARGETPLATFORM=linux/arm64
+# ---- Stage 1: build deps in an isolated layer --------------------------------
+FROM python:3.11-slim-bookworm AS builder
 
-WORKDIR /app
-
-# Install OS-level build deps needed by some Python packages on ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /build
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scraper.py .
+RUN python -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# The .env file is mounted at runtime via Docker secrets or --env-file;
-# never bake credentials into the image.
-ENV PYTHONUNBUFFERED=1
+# ---- Stage 2: lean runtime image ---------------------------------------------
+FROM python:3.11-slim-bookworm AS runtime
 
-# Output CSV lives in a named volume so data persists across container restarts.
+COPY --from=builder /venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# Install Playwright Chromium only on architectures that support it.
+# TARGETARCH is set automatically by `docker buildx build --platform …`.
+#   arm/v7 (32-bit Pi OS) → skip  — no Chromium binary available
+#   arm64  (64-bit Pi OS) → install
+#   amd64  (dev/CI)       → install
+ARG TARGETARCH
+RUN if [ "${TARGETARCH}" = "arm64" ] || [ "${TARGETARCH}" = "amd64" ]; then \
+        playwright install --with-deps chromium; \
+    else \
+        echo "Playwright Chromium skipped on ${TARGETARCH:-arm} (not supported on 32-bit ARM)."; \
+        echo "Browser scraping unavailable; use reddit_public.py + the API receiver instead."; \
+    fi
+
+# ---- Application -------------------------------------------------------------
+WORKDIR /app
+COPY . .
+
+RUN mkdir -p /app/data
 VOLUME ["/app/data"]
-ENV OUTPUT_CSV=/app/data/rscore_data.csv
 
-CMD ["python", "scraper.py"]
+ENV PYTHONUNBUFFERED=1
+ENV DB_PATH=/app/data/harvest.db
+
+EXPOSE 8000
+
+# Default: run the FastAPI ingest receiver.
+# Override at runtime for the Reddit scraper:
+#   docker run … python -m extractors.reddit_public
+CMD ["uvicorn", "api.receiver:app", "--host", "0.0.0.0", "--port", "8000"]
